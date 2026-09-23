@@ -886,4 +886,4 @@ if __name__ == "__main__":
     # Render assigns dynamic port via PORT environment variable
     port = int(os.getenv("PORT", 8080))
     # Binding without explicit 0.0.0.0 host automatically launches browser at localhost locally
-    ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=port)
+    ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=int(os.environ.get("PORT", 8080)), host="0.0.0.0")
