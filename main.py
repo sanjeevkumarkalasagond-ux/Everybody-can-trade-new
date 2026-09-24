@@ -1,8 +1,8 @@
-import os
-asyncio = __import__('asyncio')
+import asyncio
 from datetime import datetime, timedelta
 import hashlib
 import http.server
+import os
 import sqlite3
 import threading
 import urllib.parse
@@ -232,6 +232,79 @@ def process_indicators(df: pd.DataFrame, params: dict):
     return df.dropna()
 
 # ============================================================
+# DIRECT BROKER CANDLE FETCHING ENGINE (Zerodha Native + Fallback)
+# ============================================================
+broker_instrument_cache = {"provider": None, "data": {}}
+
+def load_broker_instruments(broker_name, api_key, session_token):
+    if broker_instrument_cache["provider"] == broker_name and broker_instrument_cache["data"]:
+        return broker_instrument_cache["data"]
+    
+    mapping = {}
+    try:
+        if broker_name == "Zerodha Kite":
+            res = requests.get("https://api.kite.trade/instruments", timeout=10)
+            if res.status_code == 200:
+                lines = res.text.splitlines()
+                for line in lines[1:]:
+                    parts = line.split(",")
+                    if len(parts) > 2:
+                        tradingsymbol = parts[2].strip('"')
+                        instrument_token = parts[0].strip('"')
+                        exchange = parts[1].strip('"')
+                        if exchange in ["NSE", "NFO"]:
+                            mapping[f"{tradingsymbol}.NS" if exchange == "NSE" else tradingsymbol] = instrument_token
+    except Exception as e:
+        print(f"Error loading instrument master: {e}")
+        
+    broker_instrument_cache["provider"] = broker_name
+    broker_instrument_cache["data"] = mapping
+    return mapping
+
+def fetch_broker_candles(broker_session, symbol, period="30d", interval="5minute"):
+    broker_name = broker_session.get("broker")
+    api_key = broker_session.get("api_key")
+    session_token = broker_session.get("session_token")
+    clean_symbol = symbol.replace(".NS", "")
+    
+    if broker_name == "Zerodha Kite" and session_token:
+        try:
+            instruments = load_broker_instruments(broker_name, api_key, session_token)
+            instrument_token = instruments.get(symbol) or instruments.get(clean_symbol)
+            
+            if instrument_token:
+                to_date = datetime.now()
+                from_date = to_date - timedelta(days=30 if "mo" in period or "d" in period else 365)
+                
+                headers = {
+                    "X-Kite-Version": "3",
+                    "Authorization": f"token {api_key}:{session_token}"
+                }
+                interval_map = {"5m": "5minute", "15m": "15minute", "60m": "60minute", "1d": "day"}
+                kite_interval = interval_map.get(interval, "5minute")
+                
+                url = f"https://api.kite.trade/historical/{instrument_token}/{kite_interval}?from={from_date.strftime('%Y-%m-%d')}&to={to_date.strftime('%Y-%m-%d')}"
+                res = requests.get(url, headers=headers, timeout=5)
+                res_json = res.json()
+                
+                if res.status_code == 200 and res_json.get("status") == "success":
+                    candles = res_json.get("data", {}).get("candles", [])
+                    if candles:
+                        df = pd.DataFrame(candles, columns=["Datetime", "Open", "High", "Low", "Close", "Volume", "OI"])
+                        df["Datetime"] = pd.to_datetime(df["Datetime"])
+                        df.set_index("Datetime", inplace=True)
+                        return df[["Open", "High", "Low", "Close", "Volume"]]
+        except Exception as e:
+            print(f"Zerodha Native Candle Error: {e}")
+
+    # Fallback to yfinance if broker session is paper trading or native fetch fails
+    yf_sym = symbol if str(symbol or "").endswith(".NS") else f"{symbol}.NS"
+    data = yf.download(tickers=yf_sym, period=period, interval=interval, auto_adjust=False, progress=False)
+    if data.empty:
+        return pd.DataFrame()
+    return data.xs(yf_sym, level=1, axis=1) if isinstance(data.columns, MultiIndex := getattr(pd, 'MultiIndex', None)) and isinstance(data.columns, pd.MultiIndex) else data.copy()
+
+# ============================================================
 # MULTI-BROKER OAUTH TOKEN EXCHANGE & VALIDATION
 # ============================================================
 def exchange_token_and_verify(broker_name, api_key, api_secret, auth_token):
@@ -426,13 +499,6 @@ def modify_broker_gtt_sl(broker_name, api_key, session_token, symbol, gtt_id, ne
         return res.status_code == 200 and res.json().get("status") == "success"
     except Exception:
         return False
-
-def fetch_broker_candles(broker_session, symbol, period, interval):
-    yf_sym = symbol if str(symbol or "").endswith(".NS") else f"{symbol}.NS"
-    data = yf.download(tickers=yf_sym, period=period, interval=interval, auto_adjust=False, progress=False)
-    if data.empty:
-        return pd.DataFrame()
-    return data.xs(yf_sym, level=1, axis=1) if isinstance(data.columns, getattr(pd, 'MultiIndex', None)) and isinstance(data.columns, pd.MultiIndex) else data.copy()
 
 # ============================================================
 # MAIN APPLICATION SETUP (FLET UI)
@@ -631,259 +697,351 @@ def main(page: ft.Page):
             elif previous["ST_DIRECTION"] == 1 and latest["ST_DIRECTION"] == -1:
                 return "SELL", "SuperTrend Red Flip (Price broke below SuperTrend support)"
         elif ind_name == "Bollinger Bands":
-            if price > latest["BB_HIGH"]:
-                return "BUY", "Bollinger Band Upper Breakout"
-            elif price < latest["BB_LOW"]:
-                return "SELL", "Bollinger Band Lower Breakdown"
-        return "NEUTRAL", "No breakout detected"
+            if previous["Close"] <= previous["BB_HIGH"] and latest["Close"] > latest["BB_HIGH"]:
+                return "BUY", "Upper Bollinger Band Breakout (Price closed above Upper Band)"
+            elif previous["Close"] >= previous["BB_LOW"] and latest["Close"] < latest["BB_LOW"]:
+                return "SELL", "Lower Bollinger Band Breakdown (Price closed below Lower Band)"
+        return "NEUTRAL", f"No breakout detected for {ind_name}"
 
-    def connect_broker(e):
-        selected = broker_dropdown.value
-        active_broker_session["broker"] = selected
-        active_broker_session["api_key"] = api_key_input.value
-        active_broker_session["api_secret"] = api_secret_input.value
+    def close_position(pos, reason="Manual"):
+        if pos in portfolio_state["positions"]:
+            portfolio_state["positions"].remove(pos)
+            db_remove_open_position(pos["symbol"], pos["option_type"])
+            exit_price = pos.get("current_price", pos["entry_price"])
+            realized_pnl = (exit_price - pos["entry_price"]) * pos["qty"]
+            portfolio_state["cash"] += (pos["entry_price"] * pos["qty"]) + realized_pnl
+            closed_record = {
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "symbol": pos["symbol"],
+                "option_type": pos["option_type"], "entry_price": pos["entry_price"],
+                "exit_price": exit_price, "qty": pos["qty"], "realized_pnl": realized_pnl, "reason": reason
+            }
+            portfolio_state["history"].append(closed_record)
+            db_log_closed_trade(closed_record)
 
-        if selected == "Paper Trading":
-            active_broker_session["connected"] = True
-            broker_connection_status.value = "Connected to Paper Trading Sandbox 🟢"
-            broker_connection_status.color = "green"
-            dashboard_container.visible = True
-            page.update()
-            return
+    def update_portfolio_ui():
+        total_unrealized_pnl = 0.0
+        open_rows = []
+        for pos in list(portfolio_state["positions"]):
+            try:
+                live_df = fetch_broker_candles(active_broker_session, pos["symbol"], "1d", "5m")
+                current_spot = float(live_df["Close"].iloc[-1]) if not live_df.empty else pos["spot_at_entry"]
+            except Exception:
+                current_spot = pos["spot_at_entry"]
 
-        token = request_token_input.value
-        if not token and oauth_callback_store["request_token"]:
-            token = oauth_callback_store["request_token"]
-            request_token_input.value = token
+            spot_diff = current_spot - pos["spot_at_entry"]
+            current_price = max(1.0, pos["entry_price"] + (spot_diff * (0.5 if pos["option_type"] == "CE" else -0.5)))
+            pos["current_price"] = current_price
 
-        success, sess_token, msg = exchange_token_and_verify(
-            selected, api_key_input.value, api_secret_input.value, token
-        )
-        if success:
-            active_broker_session["session_token"] = sess_token
-            active_broker_session["connected"] = True
-            broker_connection_status.value = msg
-            broker_connection_status.color = "green"
-            dashboard_container.visible = True
-        else:
-            active_broker_session["connected"] = False
-            broker_connection_status.value = msg
-            broker_connection_status.color = "red"
-        page.update()
+            if trailing_sl_checkbox.value and current_price > pos["entry_price"]:
+                new_sl = round_to_tick_size(current_price - (pos["entry_price"] - pos["stop_loss"]), 0.10)
+                if new_sl > pos["stop_loss"]:
+                    pos["stop_loss"] = new_sl
+                    db_update_position_sl(pos["symbol"], pos["option_type"], new_sl)
+                    if active_broker_session["broker"] == "Zerodha Kite" and pos.get("gtt_id"):
+                        modify_broker_gtt_sl(
+                            active_broker_session["broker"],
+                            active_broker_session["api_key"],
+                            active_broker_session["session_token"],
+                            pos["symbol"], pos["gtt_id"], new_sl, pos["target_price"]
+                        )
 
-    open_browser_button.on_click = connect_broker
+            if current_price <= pos["stop_loss"] or current_price >= pos["target_price"]:
+                close_position(pos, reason="SL Hit 🛑" if current_price <= pos["stop_loss"] else "Target Hit 🎯")
+                continue
 
-    def open_lightweight_chart(symbol):
-        df = scan_data_cache.get(symbol)
-        if df is None or df.empty:
-            status_text.value = f"No candle data cached for {symbol} to display chart."
-            page.update()
-            return
-
-        chart = Chart(toolbox=True)
-        chart.set(df.reset_index())
-        chart.show(block=False)
-
-    def render_tables():
-        open_positions_table.rows.clear()
-        total_pnl = 0.0
-        for pos in portfolio_state["positions"]:
-            unrealized = (pos["current_price"] - pos["entry_price"]) * pos["qty"]
-            total_pnl += unrealized
+            unrealized_pnl = (current_price - pos["entry_price"]) * pos["qty"]
+            total_unrealized_pnl += unrealized_pnl
             
-            def make_close_handler(p=pos):
-                return lambda ev: close_position(p)
+            def make_close_handler(p_item):
+                return lambda e: (close_position(p_item, reason="Manual Close"), update_portfolio_ui())
 
-            open_positions_table.rows.append(
-                ft.DataRow(cells=[
-                    ft.DataCell(ft.Text(pos["symbol"])),
-                    ft.DataCell(ft.Text(pos["option_type"])),
-                    ft.DataCell(ft.Text(f"₹{pos['entry_price']:.2f}")),
-                    ft.DataCell(ft.Text(f"₹{pos['stop_loss']:.2f}")),
-                    ft.DataCell(ft.Text(f"₹{pos['target_price']:.2f}")),
-                    ft.DataCell(ft.Text(f"₹{pos['current_price']:.2f}")),
-                    ft.DataCell(ft.Text(str(pos["qty"]))),
-                    ft.DataCell(ft.Text(f"₹{unrealized:.2f}", color="green" if unrealized >= 0 else "red")),
-                    ft.DataCell(ft.Button(content=ft.Text("Exit"), on_click=make_close_handler()))
-                ])
-            )
+            open_rows.append(ft.DataRow(cells=[
+                ft.DataCell(ft.Text(pos["symbol"], weight=ft.FontWeight.BOLD)),
+                ft.DataCell(ft.Text(pos["option_type"], color="cyan")),
+                ft.DataCell(ft.Text(f"{pos['entry_price']:,.2f}")),
+                ft.DataCell(ft.Text(f"{pos['stop_loss']:,.2f}", color="red")),
+                ft.DataCell(ft.Text(f"{pos['target_price']:,.2f}", color="green")),
+                ft.DataCell(ft.Text(f"{current_price:,.2f}")),
+                ft.DataCell(ft.Text(str(pos["qty"]))),
+                ft.DataCell(ft.Text(f"₹{unrealized_pnl:,.2f}", color="green" if unrealized_pnl >= 0 else "red")),
+                ft.DataCell(ft.Button(content=ft.Text("Close", size=10), on_click=make_close_handler(pos))),
+            ]))
 
-        trade_history_table.rows.clear()
-        history = portfolio_state["history"]
-        wins = 0
-        total_realized = 0.0
-        for trade in history:
-            pnl = trade["realized_pnl"]
-            total_realized += pnl
-            if pnl > 0:
-                wins += 1
-            trade_history_table.rows.append(
-                ft.DataRow(cells=[
-                    ft.DataCell(ft.Text(trade["time"])),
-                    ft.DataCell(ft.Text(trade["symbol"])),
-                    ft.DataCell(ft.Text(trade["option_type"])),
-                    ft.DataCell(ft.Text(f"₹{trade['entry_price']:.2f}")),
-                    ft.DataCell(ft.Text(f"₹{trade['exit_price']:.2f}")),
-                    ft.DataCell(ft.Text(str(trade["qty"]))),
-                    ft.DataCell(ft.Text(f"₹{pnl:.2f}", color="green" if pnl >= 0 else "red")),
-                    ft.DataCell(ft.Text(trade["reason"]))
-                ])
-            )
-
-        win_rate = (wins / len(history) * 100) if history else 0.0
-        portfolio_summary_text.value = f"Virtual Cash: ₹{portfolio_state['cash']:.2f} | Open Positions: {len(portfolio_state['positions'])} | Floating P&L: ₹{total_pnl:.2f}"
-        analytics_summary_text.value = f"Win Rate: {win_rate:.1f}% | Total Trades: {len(history)} | Realized P&L: ₹{total_realized:.2f}"
-
-    def close_position(pos, reason="Manual Exit"):
-        pnl = (pos["current_price"] - pos["entry_price"]) * pos["qty"]
-        portfolio_state["cash"] += (pos["current_price"] * pos["qty"])
-        portfolio_state["positions"].remove(pos)
-        db_remove_open_position(pos["symbol"], pos["option_type"])
-
-        trade_record = {
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "symbol": pos["symbol"],
-            "option_type": pos["option_type"],
-            "entry_price": pos["entry_price"],
-            "exit_price": pos["current_price"],
-            "qty": pos["qty"],
-            "realized_pnl": pnl,
-            "reason": reason
-        }
-        portfolio_state["history"].append(trade_record)
-        db_log_closed_trade(trade_record)
-        render_tables()
+        open_positions_table.rows = open_rows
+        tot_realized = sum([h["realized_pnl"] for h in portfolio_state["history"]])
+        portfolio_summary_text.value = f"Virtual Cash: ₹{portfolio_state['cash']:,.2f} | Open: {len(portfolio_state['positions'])} | P&L: ₹{tot_realized + total_unrealized_pnl:,.2f}"
         page.update()
 
-    def run_scan_engine(e):
-        status_text.value = "Fetching live candle data and calculating quantitative rules..."
-        page.update()
+    async def analyze_single_stock_async(symbol, params, htf_str, ltf_str, ind1, ind2, capital, risk_pct, atr_mult, rr_mult):
+        timeframe_map = {"5 Min": ("30d", "5m"), "15 Min": ("30d", "15m"), "1 Hour": ("60d", "60m"), "1 Day": ("1y", "1d"), "1 Week": ("2y", "1wk")}
+        htf_raw, ltf_raw = await asyncio.gather(
+            asyncio.to_thread(fetch_broker_candles, active_broker_session, symbol, timeframe_map.get(htf_str, ("1y", "1d"))[0], timeframe_map.get(htf_str, ("1y", "1d"))[1]),
+            asyncio.to_thread(fetch_broker_candles, active_broker_session, symbol, timeframe_map.get(ltf_str, ("30d", "5m"))[0], timeframe_map.get(ltf_str, ("30d", "5m"))[1])
+        )
+        if htf_raw.empty or ltf_raw.empty: return symbol, 0.0, "ERROR", "Data fetch failed", "0 Qty", "Error", ""
 
-        watchlist = [s.strip() for s in watchlist_input.value.split(",") if s.strip()]
-        params = {
-            "ma_fast": int(ma_fast_input.value or 9),
-            "ma_slow": int(ma_slow_input.value or 21),
-            "ema_fast": int(ema_fast_input.value or 9),
-            "ema_slow": int(ema_slow_input.value or 21),
-            "rsi_period": int(rsi_period_input.value or 14),
-            "macd_fast": int(macd_fast_input.value or 12),
-            "macd_slow": int(macd_slow_input.value or 26),
-            "st_period": int(st_period_input.value or 10),
-            "st_mult": float(st_mult_input.value or 3.0),
-            "bb_window": int(bb_period_input.value or 20),
-            "bb_std": float(bb_std_input.value or 2.0),
-            "atr_period": int(atr_period_input.value or 14)
-        }
+        htf_df, ltf_df = process_indicators(htf_raw, params), process_indicators(ltf_raw, params)
+        price, htf_trend = float(ltf_df["Close"].iloc[-1]), ("BULLISH" if htf_df["EMA_FAST"].iloc[-1] > htf_df["EMA_SLOW"].iloc[-1] else "BEARISH")
+        
+        sig1, desc1 = evaluate_breakout_indicator(ind1, ltf_df.iloc[-1], ltf_df.iloc[-2], price)
+        sig2, desc2 = evaluate_breakout_indicator(ind2, ltf_df.iloc[-1], ltf_df.iloc[-2], price) if ind2 != "None" else ("BUY", "Indicator 2 disabled")
+        
+        final_signal = "BUY" if (sig1 == "BUY" and (sig2 == "BUY" or ind2 == "None") and htf_trend == "BULLISH") else "HOLD"
+        option_type = "CE" if final_signal == "BUY" else "HOLD"
 
-        scan_results_table.rows.clear()
+        strike_interval = 5.0 if price < 500 else (10.0 if price < 2000 else 50.0)
+        atm_strike = round(price / strike_interval) * strike_interval
+        estimated_option_premium = round_to_tick_size(max(25.0, price * 0.035), 0.10)
 
-        for sym in watchlist:
-            df_htf = fetch_broker_candles(active_broker_session, sym, "1mo", "1d")
-            df_ltf = fetch_broker_candles(active_broker_session, sym, "5d", "5m")
+        atr_val = float(ltf_df["ATR"].iloc[-1])
+        risk_unit = max(1.0, atr_val * atr_mult * 0.4)
+        sl = round_to_tick_size(max(1.0, estimated_option_premium - risk_unit), 0.10)
+        tp = round_to_tick_size(estimated_option_premium + (risk_unit * rr_mult), 0.10)
+        
+        lot_sz = get_lot_size(symbol)
+        total_risk_amount = capital * (risk_pct / 100.0)
+        risk_per_lot = risk_unit * lot_sz
+        lots = max(1, round(total_risk_amount / risk_per_lot)) if risk_per_lot > 0 else 1
+        qty = lot_sz * lots
 
-            if df_htf.empty or df_ltf.empty:
-                continue
+        explanation = (
+            f"📌 **Algorithmic Breakdown & Option Strategy for {symbol}**:\n"
+            f"• **Spot Price**: ₹{price:,.2f} | **ATM Strike**: {atm_strike} CE\n"
+            f"• **HTF Filter ({htf_str})**: {htf_trend}\n"
+            f"• **Indicator 1 ({ind1})**: {sig1} ({desc1})\n"
+            f"• **Indicator 2 ({ind2})**: {sig2} ({desc2})\n"
+            f"• **Action Verdict**: {final_signal} ({option_type} Option)\n"
+            f"• **Est. Premium**: ₹{estimated_option_premium:,.2f} | **ATR SL**: ₹{sl:,.2f} | **Target**: ₹{tp:,.2f}\n"
+            f"• **Option Qty**: {lots} Lot/s ({qty} Qty)"
+        )
 
-            df_htf = process_indicators(df_htf, params)
-            df_ltf = process_indicators(df_ltf, params)
+        exec_note = f"Signal Verified ({lots} Lot/s)"
+        gtt_id = None
+        
+        if auto_trade_checkbox.value and final_signal == "BUY":
+            if active_broker_session["broker"] != "Paper Trading":
+                success, msg, gtt_id = place_live_broker_order(
+                    active_broker_session["broker"], 
+                    active_broker_session["api_key"], 
+                    active_broker_session["session_token"], 
+                    symbol, "BUY", qty, estimated_option_premium, sl, tp
+                )
+                exec_note = msg
+                if not success:
+                    exec_note = f"{msg} -> Logged in App Sandbox"
+            
+            if not any(p["symbol"] == symbol for p in portfolio_state["positions"]):
+                portfolio_state["cash"] -= estimated_option_premium * qty
+                new_pos = {"symbol": symbol, "option_type": option_type, "spot_at_entry": price, "entry_price": estimated_option_premium, "current_price": estimated_option_premium, "stop_loss": sl, "target_price": tp, "qty": qty, "gtt_id": gtt_id}
+                portfolio_state["positions"].append(new_pos)
+                db_save_open_position(new_pos)
+        elif final_signal == "BUY" and not auto_trade_checkbox.value:
+            if not any(p["symbol"] == symbol for p in portfolio_state["positions"]):
+                new_pos = {"symbol": symbol, "option_type": option_type, "spot_at_entry": price, "entry_price": estimated_option_premium, "current_price": estimated_option_premium, "stop_loss": sl, "target_price": tp, "qty": qty, "gtt_id": None}
+                portfolio_state["positions"].append(new_pos)
+                db_save_open_position(new_pos)
 
-            if len(df_ltf) < 2 or len(df_htf) < 2:
-                continue
+        return symbol, price, htf_trend, option_type, f"{lots} Lot ({qty})", exec_note, explanation
 
-            scan_data_cache[sym] = df_ltf
+    def render_tradingview_chart(e, target_sym=None):
+        sym = target_sym
+        if not sym:
+            status_text.value = "Error: No symbol selected for charting."
+            page.update()
+            return
+        
+        try:
+            params = {
+                "ma_fast": int(ma_fast_input.value or 9), "ma_slow": int(ma_slow_input.value or 21),
+                "ema_fast": int(ema_fast_input.value or 9), "ema_slow": int(ema_slow_input.value or 21),
+                "rsi_period": int(rsi_period_input.value or 14), "macd_fast": int(macd_fast_input.value or 12),
+                "macd_slow": int(macd_slow_input.value or 26), "st_period": int(st_period_input.value or 10),
+                "st_mult": float(st_mult_input.value or 3.0), "bb_window": int(bb_period_input.value or 20),
+                "bb_std": float(bb_std_input.value or 2.0), "atr_period": int(atr_period_input.value or 14)
+            }
+            df_raw = fetch_broker_candles(active_broker_session, sym, "30d", "5m")
+            if df_raw.empty:
+                status_text.value = f"Error: No candle data returned for {sym}"
+                page.update()
+                return
+            
+            df = process_indicators(df_raw, params)
+            chart = Chart(title=f"TradingView Workspace - {sym}", width=1100, height=600)
+            chart.legend(True)
 
-            latest_ltf, prev_ltf = df_ltf.iloc[-1], df_ltf.iloc[-2]
-            latest_htf = df_htf.iloc[-1]
-            spot_price = float(latest_ltf["Close"])
+            chart_df = df.reset_index()
+            date_col = next((col for col in chart_df.columns if str(col).lower() in ['date', 'datetime', 'time']), chart_df.columns[0])
+            
+            chart_df = chart_df.rename(columns={date_col: 'time', 'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'})
+            chart_df['time'] = pd.to_datetime(chart_df['time']).dt.strftime('%Y-%m-%d %H:%M:%S')
 
-            htf_trend = "BULLISH" if latest_htf["MA_FAST"] > latest_htf["MA_SLOW"] else "BEARISH"
+            chart.set(chart_df[['time', 'open', 'high', 'low', 'close', 'volume']])
 
-            sig1, r1 = evaluate_breakout_indicator(indicator_1_dropdown.value, latest_ltf, prev_ltf, spot_price)
-            sig2, r2 = ("NEUTRAL", "None") if indicator_2_dropdown.value == "None" else evaluate_breakout_indicator(indicator_2_dropdown.value, latest_ltf, prev_ltf, spot_price)
-
-            signal = "HOLD"
-            rationale = "No aligned breakout."
-
-            if sig1 == "BUY" and (sig2 in ["BUY", "NEUTRAL"]) and htf_trend == "BULLISH":
-                signal = "BUY CALL (CE)"
-                rationale = f"{r1} | HTF Trend is Bullish"
-            elif sig1 == "SELL" and (sig2 in ["SELL", "NEUTRAL"]) and htf_trend == "BEARISH":
-                signal = "BUY PUT (PE)"
-                rationale = f"{r1} | HTF Trend is Bearish"
-
-            lot_qty = get_lot_size(sym)
-            status_str = "Scanned"
-
-            if signal != "HOLD" and auto_trade_checkbox.value:
-                atr_val = float(latest_ltf["ATR"])
-                mult = float(atr_mult_dropdown.value.split("x")[0])
-                sl_dist = atr_val * mult
+            ind1 = indicator_1_dropdown.value
+            if ind1 == "MA Crossover":
+                name_fast = f"MA {params['ma_fast']}"
+                name_slow = f"MA {params['ma_slow']}"
+                chart_df[name_fast] = chart_df['MA_FAST']
+                chart_df[name_slow] = chart_df['MA_SLOW']
                 
-                option_type = "CE" if "CALL" in signal else "PE"
-                entry_price = round_to_tick_size(spot_price * 0.02) # Simulated option premium
-                sl_price = round_to_tick_size(entry_price - (sl_dist * 0.05))
-                target_ratio = float(target_rr_dropdown.value.split(":")[1])
-                target_price = round_to_tick_size(entry_price + ((entry_price - sl_price) * target_ratio))
+                line_fast = chart.create_line(name=name_fast, price_scale_id='right', color='#22c55e')
+                line_fast.set(chart_df[['time', name_fast]])
+                line_slow = chart.create_line(name=name_slow, price_scale_id='right', color='#ef4444')
+                line_slow.set(chart_df[['time', name_slow]])
+            elif ind1 == "SuperTrend":
+                chart_df["SuperTrend"] = chart_df['SUPERTREND']
+                st_line = chart.create_line(name="SuperTrend", price_scale_id='right', color='#eab308')
+                st_line.set(chart_df[['time', "SuperTrend"]])
+            elif ind1 == "Bollinger Bands":
+                chart_df["BB High"] = chart_df['BB_HIGH']
+                chart_df["BB Low"] = chart_df['BB_LOW']
+                bb_high = chart.create_line(name="BB High", price_scale_id='right', color='gray')
+                bb_high.set(chart_df[['time', "BB High"]])
+                bb_low = chart.create_line(name="BB Low", price_scale_id='right', color='gray')
+                bb_low.set(chart_df[['time', "BB Low"]])
+            elif ind1 == "MACD":
+                chart_df["MACD"] = chart_df['MACD']
+                chart_df["MACD Signal"] = chart_df['MACD_SIGNAL']
+                macd_line = chart.create_line(name="MACD", price_scale_id='right', color='#38bdf8')
+                macd_line.set(chart_df[['time', "MACD"]])
+                sig_line = chart.create_line(name="MACD Signal", price_scale_id='right', color='#f97316')
+                sig_line.set(chart_df[['time', "MACD Signal"]])
 
-                if active_broker_session["broker"] != "Paper Trading" and active_broker_session["connected"]:
-                    success, msg, gtt_id = place_live_broker_order(
-                        active_broker_session["broker"], active_broker_session["api_key"],
-                        active_broker_session["session_token"], sym, "BUY", lot_qty, entry_price, sl_price, target_price
-                    )
-                    status_str = "Executed Live" if success else "Execution Failed"
-                else:
-                    new_pos = {
-                        "symbol": sym, "option_type": option_type, "spot_at_entry": spot_price,
-                        "entry_price": entry_price, "current_price": entry_price,
-                        "stop_loss": sl_price, "target_price": target_price,
-                        "qty": lot_qty, "gtt_id": None
-                    }
-                    portfolio_state["positions"].append(new_pos)
-                    db_save_open_position(new_pos)
-                    status_str = "Executed Virtual"
+            if sym in scan_data_cache:
+                explanation_card_content.value = scan_data_cache[sym]
 
-            def make_chart_handler(s=sym):
-                return lambda ev: open_lightweight_chart(s)
+            status_text.value = f"Opening TradingView chart window for {sym}..."
+            page.update()
 
-            def make_rationale_handler(r=rationale):
-                return lambda ev: update_rationale_display(r)
+            def run_chart():
+                try:
+                    chart.show()
+                except Exception as ex:
+                    print(f"Chart Window Exception: {ex}")
 
-            scan_results_table.rows.append(
-                ft.DataRow(cells=[
-                    ft.DataCell(ft.Text(sym, color="cyan"), on_click=make_chart_handler()),
-                    ft.DataCell(ft.Text(f"₹{spot_price:.2f}")),
-                    ft.DataCell(ft.Text(htf_trend, color="green" if htf_trend == "BULLISH" else "red")),
-                    ft.DataCell(ft.Text(signal, weight=ft.FontWeight.BOLD)),
-                    ft.DataCell(ft.Text(str(lot_qty))),
-                    ft.DataCell(ft.Text(status_str)),
-                    ft.DataCell(ft.Button(content=ft.Text("View Rationale"), on_click=make_rationale_handler()))
-                ])
+            threading.Thread(target=run_chart, daemon=True).start()
+
+        except Exception as e:
+            status_text.value = f"Chart Error: {str(e)}"
+            page.update()
+
+    async def scan_watchlist(e=None):
+        autocomplete_container.visible = False
+        raw_watchlist = str(watchlist_input.value or "")
+        symbols = [s.strip().upper() + (".NS" if not s.strip().upper().endswith(".NS") else "") for s in raw_watchlist.split(",") if s.strip()]
+        
+        params = {
+            "ma_fast": int(ma_fast_input.value or 9), "ma_slow": int(ma_slow_input.value or 21),
+            "ema_fast": int(ema_fast_input.value or 9), "ema_slow": int(ema_slow_input.value or 21),
+            "rsi_period": int(rsi_period_input.value or 14), "macd_fast": int(macd_fast_input.value or 12),
+            "macd_slow": int(macd_slow_input.value or 26), "st_period": int(st_period_input.value or 10),
+            "st_mult": float(st_mult_input.value or 3.0), "bb_window": int(bb_period_input.value or 20),
+            "bb_std": float(bb_std_input.value or 2.0), "atr_period": int(atr_period_input.value or 14)
+        }
+        results = await asyncio.gather(*[analyze_single_stock_async(sym, params, htf_dropdown.value, ltf_dropdown.value, indicator_1_dropdown.value, indicator_2_dropdown.value, float(capital_input.value), float(risk_pct_input.value), float(atr_mult_dropdown.value.split("x")[0]), float(target_rr_dropdown.value.split(":")[1])) for sym in symbols])
+
+        scan_data_cache.clear()
+        for s, p, h, o, q, n, explanation in results:
+            scan_data_cache[s] = explanation
+
+        def make_chart_click_handler(target_sym):
+            return lambda ev: render_tradingview_chart(None, target_sym=target_sym)
+
+        def make_rationale_click_handler(target_sym):
+            return lambda ev: (
+                setattr(explanation_card_content, "value", scan_data_cache.get(target_sym, "No rationale available.")),
+                page.update()
             )
 
-        render_tables()
-        status_text.value = f"Scan complete at {datetime.now().strftime('%H:%M:%S')}."
+        scan_results_table.rows = [
+            ft.DataRow(cells=[
+                ft.DataCell(ft.Row([ft.Button(content=ft.Text(s, size=11), on_click=make_chart_click_handler(s))])),
+                ft.DataCell(ft.Text(f"{p:,.2f}")),
+                ft.DataCell(ft.Text(h)),
+                ft.DataCell(ft.Text(o, color="cyan")),
+                ft.DataCell(ft.Text(q)),
+                ft.DataCell(ft.Text(n, size=11)),
+                ft.DataCell(ft.Button(content=ft.Text("View Rationale", size=10), on_click=make_rationale_click_handler(s)))
+            ]) for s, p, h, o, q, n, _ in results
+        ]
+        
+        if results:
+            first_sym = results[0][0]
+            if first_sym in scan_data_cache:
+                explanation_card_content.value = scan_data_cache[first_sym]
+        
+        update_portfolio_ui()
         page.update()
 
-    def update_rationale_display(r_text):
-        explanation_card_content.value = f"### Quant Breakdown\n{r_text}"
+    scan_button.on_click = scan_watchlist
+
+    def on_login_and_connect(e):
+        broker = broker_dropdown.value
+        key = str(api_key_input.value or "").strip()
+        secret = str(api_secret_input.value or "").strip()
+        token = str(request_token_input.value or "").strip()
+
+        if broker == "Paper Trading":
+            active_broker_session.update({"broker": "Paper Trading", "connected": True})
+            login_card.visible, dashboard_container.visible = False, True
+            broker_connection_status.value, broker_connection_status.color = "Connected to Sandbox 🟢", "green"
+            page.update()
+            return
+
+        if token:
+            valid, stoken, msg = exchange_token_and_verify(broker, key, secret, token)
+            if valid:
+                active_broker_session.update({"broker": broker, "api_key": key, "session_token": stoken, "connected": True})
+                login_card.visible, dashboard_container.visible = False, True
+            broker_connection_status.value, broker_connection_status.color = msg, ("green" if valid else "red")
+            page.update()
+            return
+
+        oauth_callback_store["request_token"] = None
+        threading.Thread(target=start_local_server, daemon=True).start()
+        
+        import webbrowser
+        if broker == "Zerodha Kite": webbrowser.open(f"https://kite.zerodha.com/connect/login?api_key={key}&v=3")
+        elif broker == "Upstox": webbrowser.open(f"https://api-v2.upstox.com/login/authorization/dialog?client_id={key}&redirect_uri=https://127.0.0.1&response_type=code")
+        elif broker == "Angel One": webbrowser.open("https://smartapi.angelone.in/login")
+        
+        broker_connection_status.value, broker_connection_status.color = "Browser opened. Authenticate...", "orange"
         page.update()
 
-    scan_button.on_click = run_scan_engine
+        def background_wait():
+            while oauth_callback_store["request_token"] is None:
+                import time; time.sleep(0.5)
+            request_token_input.value = str(oauth_callback_store["request_token"] or "")
+            page.update()
+            on_login_and_connect(None)
+        threading.Thread(target=background_wait, daemon=True).start()
 
-    page.add(
-        header,
-        subtitle,
-        login_card,
-        dashboard_container
-    )
-    
-    render_tables()
-    
-    # Run the OAuth listener background thread
-    threading.Thread(target=start_local_server, daemon=True).start()
+    open_browser_button.on_click = on_login_and_connect
+
+    async def portfolio_refresh_loop():
+        while True:
+            await asyncio.sleep(3)
+            if dashboard_container.visible:
+                try:
+                    update_portfolio_ui()
+                except Exception:
+                    pass
+
+    page.run_task(portfolio_refresh_loop)
+
+    page.add(header, subtitle, login_card, dashboard_container)
 
 if __name__ == "__main__":
-    # Render assigns dynamic port via PORT environment variable
-    port = int(os.getenv("PORT", 8080))
-    # Binding without explicit 0.0.0.0 host automatically launches browser at localhost locally
-    ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=int(os.environ.get("PORT", 8080)), host="0.0.0.0")
+    ft.run(
+        main,
+        view=ft.AppView.WEB_BROWSER,
+        port=int(os.environ.get("PORT", 8080)),
+        host="0.0.0.0"
+    )
+    if __name__ == "__main__":
+     ft.run(
+        main, 
+        view=ft.AppView.WEB_BROWSER, 
+        port=int(os.environ.get("PORT", 8080)), 
+        host="127.0.0.1"
+    )
