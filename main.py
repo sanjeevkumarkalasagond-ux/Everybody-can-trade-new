@@ -6,7 +6,6 @@ import os
 import sqlite3
 import threading
 import urllib.parse
-import webbrowser
 import flet as ft
 from lightweight_charts import Chart
 import pandas as pd
@@ -126,7 +125,7 @@ def db_load_trade_history():
     return history
 
 # ============================================================
-# UPDATED GLOBAL OAUTH SERVER FOR REDIRECTS
+# GLOBAL OAUTH SERVER FOR REDIRECTS
 # ============================================================
 oauth_callback_store = {"request_token": None}
 
@@ -135,26 +134,17 @@ class OAuthRedirectHandler(http.server.BaseHTTPRequestHandler):
         parsed_url = urllib.parse.urlparse(self.path)
         query_params = urllib.parse.parse_qs(parsed_url.query)
         
-        token_key = "request_token" if "request_token" in query_params else ("code" if "code" in query_params else None)
-        if token_key and query_params[token_key]:
+        token_key = "request_token" if "request_token" in query_params else "code"
+        if token_key in query_params:
             oauth_callback_store["request_token"] = query_params[token_key][0]
             self.send_response(200)
             self.send_header("Content-type", "text/html")
             self.end_headers()
-            html_response = """
-            <html>
-                <body style="font-family: Arial, sans-serif; text-align: center; padding-top: 50px; background-color: #121212; color: #ffffff;">
-                    <h2 style="color: #00e676;">Authentication Successful! 🟢</h2>
-                    <p>Token captured. You can close this browser tab and return to your workspace.</p>
-                </body>
-            </html>
-            """
-            self.wfile.write(html_response.encode("utf-8"))
+            self.wfile.write(b"<h3>Authentication Successful! You can close this tab and return to market workspace.</h3>")
         else:
-            self.send_response(200)
-            self.send_header("Content-type", "text/html")
+            self.send_response(400)
             self.end_headers()
-            self.wfile.write(b"<html><body><h3>Waiting for OAuth Callback...</h3></body></html>")
+            self.wfile.write(b"<h3>Authorization failed or missing token.</h3>")
 
     def log_message(self, format, *args):
         pass
@@ -163,14 +153,11 @@ def start_local_server():
     try:
         server = http.server.HTTPServer(("127.0.0.1", 8000), OAuthRedirectHandler)
         server.timeout = 1.0
-        # Serve requests for up to 120 seconds or until token is captured
-        for _ in range(120):
-            if oauth_callback_store["request_token"] is not None:
-                break
+        while oauth_callback_store["request_token"] is None:
             server.handle_request()
         server.server_close()
-    except Exception as e:
-        print(f"Local OAuth Server Exception: {e}")
+    except Exception:
+        pass
 
 # ============================================================
 # NSE LOT SIZES & TECHNICAL INDICATORS
@@ -245,7 +232,7 @@ def process_indicators(df: pd.DataFrame, params: dict):
     return df.dropna()
 
 # ============================================================
-# DIRECT BROKER CANDLE FETCHING ENGINE
+# DIRECT BROKER CANDLE FETCHING ENGINE (Zerodha Native + Fallback)
 # ============================================================
 broker_instrument_cache = {"provider": None, "data": {}}
 
@@ -315,16 +302,16 @@ def fetch_broker_candles(broker_session, symbol, period="30d", interval="5minute
     data = yf.download(tickers=yf_sym, period=period, interval=interval, auto_adjust=False, progress=False)
     if data.empty:
         return pd.DataFrame()
-    return data.xs(yf_sym, level=1, axis=1) if isinstance(data.columns, getattr(pd, 'MultiIndex', None)) and isinstance(data.columns, pd.MultiIndex) else data.copy()
+    return data.xs(yf_sym, level=1, axis=1) if isinstance(data.columns, MultiIndex := getattr(pd, 'MultiIndex', None)) and isinstance(data.columns, pd.MultiIndex) else data.copy()
 
 # ============================================================
 # MULTI-BROKER OAUTH TOKEN EXCHANGE & VALIDATION
 # ============================================================
 def exchange_token_and_verify(broker_name, api_key, api_secret, auth_token):
     try:
-        api_key = str(api_key or "").strip()
-        api_secret = str(api_secret or "").strip()
-        auth_token = str(auth_token or "").strip()
+        api_key = str(api_key or "")
+        api_secret = str(api_secret or "")
+        auth_token = str(auth_token or "")
 
         if not api_key or not api_secret:
             return False, "", "API Key and Secret cannot be empty 🔴"
@@ -341,7 +328,7 @@ def exchange_token_and_verify(broker_name, api_key, api_secret, auth_token):
 
         elif broker_name == "Upstox":
             headers = {"accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"}
-            payload = {"code": auth_token, "client_id": api_key, "client_secret": api_secret, "redirect_uri": "http://127.0.0.1:8000/", "grant_type": "authorization_code"}
+            payload = {"code": auth_token, "client_id": api_key, "client_secret": api_secret, "redirect_uri": "https://127.0.0.1", "grant_type": "authorization_code"}
             response = requests.post("https://api-v2.upstox.com/login/authorization/token", headers=headers, data=payload, timeout=5)
             res = response.json()
             if response.status_code == 200 and res.get("status") == "success":
@@ -1013,14 +1000,12 @@ def main(page: ft.Page):
         oauth_callback_store["request_token"] = None
         threading.Thread(target=start_local_server, daemon=True).start()
         
-        if broker == "Zerodha Kite": 
-            webbrowser.open(f"https://kite.zerodha.com/connect/login?api_key={key}&v=3")
-        elif broker == "Upstox": 
-            webbrowser.open(f"https://api-v2.upstox.com/login/authorization/dialog?client_id={key}&redirect_uri=http://127.0.0.1:8000/&response_type=code")
-        elif broker == "Angel One": 
-            webbrowser.open("https://smartapi.angelone.in/login")
+        import webbrowser
+        if broker == "Zerodha Kite": webbrowser.open(f"https://kite.zerodha.com/connect/login?api_key={key}&v=3")
+        elif broker == "Upstox": webbrowser.open(f"https://api-v2.upstox.com/login/authorization/dialog?client_id={key}&redirect_uri=https://127.0.0.1&response_type=code")
+        elif broker == "Angel One": webbrowser.open("https://smartapi.angelone.in/login")
         
-        broker_connection_status.value, broker_connection_status.color = "Browser opened. Complete login & verify...", "orange"
+        broker_connection_status.value, broker_connection_status.color = "Browser opened. Authenticate...", "orange"
         page.update()
 
         def background_wait():
@@ -1029,7 +1014,6 @@ def main(page: ft.Page):
             request_token_input.value = str(oauth_callback_store["request_token"] or "")
             page.update()
             on_login_and_connect(None)
-            
         threading.Thread(target=background_wait, daemon=True).start()
 
     open_browser_button.on_click = on_login_and_connect
@@ -1052,5 +1036,12 @@ if __name__ == "__main__":
         main,
         view=ft.AppView.WEB_BROWSER,
         port=int(os.environ.get("PORT", 8080)),
+        host="0.0.0.0"
+    )
+    if __name__ == "__main__":
+     ft.run(
+        main, 
+        view=ft.AppView.WEB_BROWSER, 
+        port=int(os.environ.get("PORT", 8080)), 
         host="0.0.0.0"
     )
